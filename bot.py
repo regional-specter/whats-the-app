@@ -3,6 +3,7 @@ import discord
 from discord.ext import commands
 from detection.ypt_detector import is_ypt_screenshot
 from dotenv import load_dotenv
+from rapidfuzz import fuzz
 import re
 
 # Load environment variables
@@ -15,6 +16,19 @@ intents.message_content = True
 intents.messages = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+def is_question_about_app_keywords(message_content):
+    msg = message_content.lower()
+    keywords_sets = [
+        {"what", "app", "called"},
+        {"whats", "name", "app"},
+        {"which", "app"},
+        {"app", "name"}
+    ]
+    for kw_set in keywords_sets:
+        if all(kw in msg for kw in kw_set):
+            return True
+    return False
 
 # Precompile regex patterns for detecting questions about the app
 question_patterns = [
@@ -33,7 +47,7 @@ async def on_message(message):
         return
 
     # Check text for question patterns
-    if any(pattern.search(message.content) for pattern in question_patterns):
+    if is_question_about_app_keywords(message.content):
         await message.reply("The app is called YPT! ✅")
         return  # Optional: stop further processing
 
