@@ -20,12 +20,9 @@ TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
 templates = []
 for filename in os.listdir(TEMPLATES_DIR):
     if filename.lower().endswith((".png", ".jpg", ".jpeg")):
-        path = os.path.join(TEMPLATES_DIR, filename)
-        img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-        if img is None:
-            continue
-        edges = cv2.Canny(img, 50, 150)
-        templates.append(edges)
+        img = cv2.imread(os.path.join(TEMPLATES_DIR, filename), cv2.IMREAD_GRAYSCALE)
+        if img is not None:
+            templates.append(cv2.Canny(img, 50, 150))
 
 # ---------------------------
 # Load sample screenshots (edges)
@@ -34,120 +31,136 @@ for filename in os.listdir(TEMPLATES_DIR):
 samples = []
 for filename in os.listdir(SAMPLES_DIR):
     if filename.lower().endswith((".png", ".jpg", ".jpeg")):
-        path = os.path.join(SAMPLES_DIR, filename)
-        img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-        if img is None:
-            continue
-        edges = cv2.Canny(img, 50, 150)
-        samples.append(edges)
+        img = cv2.imread(os.path.join(SAMPLES_DIR, filename), cv2.IMREAD_GRAYSCALE)
+        if img is not None:
+            samples.append(cv2.Canny(img, 50, 150))
 
 # ---------------------------
 # Hard rejection filters
 # ---------------------------
 
 def is_low_information(gray):
-    """
-    Reject blank / near-blank images.
-    """
-    # Pixel variance (solid colors fail here)
     if np.std(gray) < 10:
         return True
 
-    # Edge density (UI must have structure)
     edges = cv2.Canny(gray, 50, 150)
-    edge_ratio = np.count_nonzero(edges) / edges.size
-
-    return edge_ratio < 0.01
+    return (np.count_nonzero(edges) / edges.size) < 0.01
 
 
 def has_text_or_numbers(gray):
-    """
-    Require visible UI text or numbers.
-    """
     text = pytesseract.image_to_string(gray, config="--psm 6").strip()
+    return len(text) >= 3 and bool(re.search(r"\d|[A-Za-z]{3,}", text))
 
-    if len(text) < 3:
-        return False
+# ---------------------------
+# YPT semantic signals
+# ---------------------------
 
-    has_number = bool(re.search(r"\d", text))
-    has_word = bool(re.search(r"[A-Za-z]{3,}", text))
+YPT_KEYWORDS = [
+    "insights", "max focus", "started", "finished",
+    "period", "trend", "today", "yesterday"
+]
 
-    return has_number or has_word
+def semantic_text_score(gray):
+    text = pytesseract.image_to_string(gray, config="--psm 6").lower()
+    return sum(1 for kw in YPT_KEYWORDS if kw in text)
+
+
+def time_pattern_score(gray):
+    text = pytesseract.image_to_string(gray, config="--psm 6")
+    has_hms = bool(re.search(r"\d{1,2}:\d{2}:\d{2}", text))
+    has_ampm = bool(re.search(r"\b(am|pm)\b", text, re.I))
+    return 2 if has_hms and has_ampm else 0
+
+# ---------------------------
+# Donut chart detection
+# ---------------------------
+
+def donut_chart_score(gray):
+    circles = cv2.HoughCircles(
+        gray,
+        cv2.HOUGH_GRADIENT,
+        dp=1.2,
+        minDist=100,
+        param1=100,
+        param2=30,
+        minRadius=40,
+        maxRadius=200
+    )
+
+    if circles is None:
+        return 0
+
+    text = pytesseract.image_to_string(gray, config="--psm 6")
+    return 3 if "%" in text else 1
+
+# ---------------------------
+# Color fingerprint
+# ---------------------------
+
+def color_fingerprint_score(img):
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+
+    red_mask = cv2.inRange(hsv, (0, 80, 80), (10, 255, 255))
+    green_mask = cv2.inRange(hsv, (35, 40, 40), (85, 255, 255))
+
+    red_ratio = np.count_nonzero(red_mask) / red_mask.size
+    green_ratio = np.count_nonzero(green_mask) / green_mask.size
+
+    return 2 if red_ratio > 0.01 and green_ratio > 0.01 else 0
 
 # ---------------------------
 # Similarity helpers
 # ---------------------------
 
 def match_template(image_edges, template_edges, threshold=0.6):
-    """
-    Template match using normalized correlation.
-    """
-    if template_edges.shape[0] > image_edges.shape[0] or template_edges.shape[1] > image_edges.shape[1]:
-        template_edges = cv2.resize(
-            template_edges,
-            (image_edges.shape[1], image_edges.shape[0])
-        )
-
+    template_edges = cv2.resize(template_edges, image_edges.shape[::-1])
     res = cv2.matchTemplate(image_edges, template_edges, cv2.TM_CCOEFF_NORMED)
     return np.any(res >= threshold)
 
 
 def compare_with_samples(image_edges, threshold=0.75):
-    """
-    Structural similarity check against known YPT samples.
-    """
-    for sample_edges in samples:
-        resized = cv2.resize(sample_edges, (image_edges.shape[1], image_edges.shape[0]))
-        score = ssim(image_edges, resized)
-        if score >= threshold:
+    for sample in samples:
+        resized = cv2.resize(sample, image_edges.shape[::-1])
+        if ssim(image_edges, resized) >= threshold:
             return True
     return False
 
 # ---------------------------
-# Main detector
+# Main detector (score-based)
 # ---------------------------
 
-def is_ypt_screenshot(image_path):
-    """
-    Strict YPT screenshot detector.
-    Returns True ONLY if UI + YPT similarity are present.
-    """
+def is_ypt_screenshot(image_path, score_threshold=7):
     img = cv2.imread(image_path)
     if img is None:
         return False
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    # 🚨 HARD GATES (non-negotiable)
-    if is_low_information(gray):
+    if is_low_information(gray) or not has_text_or_numbers(gray):
         return False
 
-    if not has_text_or_numbers(gray):
-        return False
+    score = 0
+    score += semantic_text_score(gray)
+    score += time_pattern_score(gray)
+    score += donut_chart_score(gray)
+    score += color_fingerprint_score(img)
 
-    # ---- YPT-specific checks ----
     edges = cv2.Canny(gray, 50, 150)
 
-    # Template voting
-    template_hits = sum(match_template(edges, t) for t in templates)
-    if template_hits >= 1:
-        return True
+    if any(match_template(edges, t) for t in templates):
+        score += 1
 
-    # SSIM fallback
     if compare_with_samples(edges):
-        return True
+        score += 1
 
-    return False
+    return score >= score_threshold
 
 # ---------------------------
 # Manual test
 # ---------------------------
 
 if __name__ == "__main__":
-    test_images = [
-        "../data/sample_screenshots/ypt-21.jpeg",
-    ]
+    tests = ["../data/sample_screenshots/ypt-21.jpeg"]
 
-    for img_path in test_images:
-        result = is_ypt_screenshot(img_path)
-        print(f"{img_path} → {'YPT ✅' if result else 'NOT YPT ❌'}")
+    for img in tests:
+        print(img, "→", "YPT ✅" if is_ypt_screenshot(img) else "NOT YPT ❌")
