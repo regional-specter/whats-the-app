@@ -65,10 +65,21 @@ async def on_message(message):
     if message.author == bot.user:
         return
 
-    # 🔒 SINGLE SOURCE OF TRUTH
-    # Reply ONLY if a YPT image is actually detected
-    if await contains_ypt_image(message):
-        await message.reply("The app is called YPT! ✅")
+    # Step 1: Must contain a YPT image (current or referenced)
+    has_ypt = await contains_ypt_image(message)
+    if not has_ypt:
+        return
+
+    # Step 2: Check message context
+    has_text = bool(message.content.strip())
+    is_reply = message.reference is not None
+
+    # ❌ Ignore standalone image-only messages
+    if not has_text and not is_reply:
+        return
+
+    # ✅ Valid cases only
+    await message.reply("The app is called YPT! ✅")
 
 
 bot.run(TOKEN)
